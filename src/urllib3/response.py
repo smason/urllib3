@@ -192,8 +192,8 @@ class MultiDecoder(ContentDecoder):
         they were applied.
     """
 
-    def __init__(self, modes: str) -> None:
-        self._decoders = [_get_decoder(m.strip()) for m in modes.split(",")]
+    def __init__(self, decoders: list[ContentDecoder]) -> None:
+        self._decoders = decoders
 
     def flush(self) -> bytes:
         return self._decoders[0].flush()
@@ -204,22 +204,28 @@ class MultiDecoder(ContentDecoder):
         return data
 
 
-def _get_decoder(mode: str) -> ContentDecoder:
-    if "," in mode:
-        return MultiDecoder(mode)
-
-    # According to RFC 9110 section 8.4.1.3, recipients should
-    # consider x-gzip equivalent to gzip
-    if mode in ("gzip", "x-gzip"):
-        return GzipDecoder()
-
-    if brotli is not None and mode == "br":
-        return BrotliDecoder()
-
-    if zstd is not None and mode == "zstd":
-        return ZstdDecoder()
-
-    return DeflateDecoder()
+def _get_decoder(headers: HTTPHeaderDict) -> ContentDecoder | None:
+    # Note: content-encoding value should be case-insensitive, per RFC 7230
+    # Section 3.2
+    content_encoding = headers.get("content-encoding", "").lower()
+    decoders = list[ContentDecoder]()
+    for name in content_encoding.split(","):
+        mode = name.strip()
+        if mode == "deflate":
+            decoders.append(DeflateDecoder())
+        # According to RFC 9110 section 8.4.1.3, recipients should
+        # consider x-gzip equivalent to gzip
+        elif mode in ("gzip", "x-gzip"):
+            decoders.append(GzipDecoder())
+        elif brotli is not None and mode == "br":
+            decoders.append(BrotliDecoder())
+        elif zstd is not None and mode == "zstd":
+            decoders.append(ZstdDecoder())
+    if not decoders:
+        return None
+    if len(decoders) == 1:
+        return decoders[0]
+    return MultiDecoder(decoders)
 
 
 class BytesQueueBuffer:
@@ -409,25 +415,6 @@ class BaseHTTPResponse(io.IOBase):
     def close(self) -> None:
         raise NotImplementedError()
 
-    def _init_decoder(self) -> None:
-        """
-        Set-up the _decoder attribute if necessary.
-        """
-        # Note: content-encoding value should be case-insensitive, per RFC 7230
-        # Section 3.2
-        content_encoding = self.headers.get("content-encoding", "").lower()
-        if self._decoder is None:
-            if content_encoding in self.CONTENT_DECODERS:
-                self._decoder = _get_decoder(content_encoding)
-            elif "," in content_encoding:
-                encodings = [
-                    e.strip()
-                    for e in content_encoding.split(",")
-                    if e.strip() in self.CONTENT_DECODERS
-                ]
-                if encodings:
-                    self._decoder = _get_decoder(content_encoding)
-
     def _decode(
         self, data: bytes, decode_content: bool | None, flush_decoder: bool
     ) -> bytes:
@@ -592,9 +579,16 @@ class HTTPResponse(BaseHTTPResponse):
         # Used to return the correct amount of bytes for partial read()s
         self._decoded_buffer = BytesQueueBuffer()
 
+        # Parse the Content-Encoding header
+        if self.length_remaining != 0:
+            self._decoder = _get_decoder(self.headers)
+        else:
+            # no point in setting this up if it's never going to decode anything
+            self._decoder = None
+
         # If requested, preload the body.
         if preload_content and not self._body:
-            self._body = self.read(decode_content=decode_content)
+            self._body = self.read()
 
     def release_conn(self) -> None:
         if not self._pool or not self._connection:
@@ -642,59 +636,61 @@ class HTTPResponse(BaseHTTPResponse):
 
     def _init_length(self, request_method: str | None) -> int | None:
         """
-        Set initial length value for Response content if available.
+        Parse initial length value for Response content if available.
         """
-        length: int | None
-        content_length: str | None = self.headers.get("content-length")
-
-        if content_length is not None:
-            if self.chunked:
-                # This Response will fail with an IncompleteRead if it can't be
-                # received as chunked. This method falls back to attempt reading
-                # the response before raising an exception.
-                log.warning(
-                    "Received response with both Content-Length and "
-                    "Transfer-Encoding set. This is expressly forbidden "
-                    "by RFC 7230 sec 3.3.2. Ignoring Content-Length and "
-                    "attempting to process response as Transfer-Encoding: "
-                    "chunked."
-                )
-                return None
-
-            try:
-                # RFC 7230 section 3.3.2 specifies multiple content lengths can
-                # be sent in a single Content-Length header
-                # (e.g. Content-Length: 42, 42). This line ensures the values
-                # are all valid ints and that as long as the `set` length is 1,
-                # all values are the same. Otherwise, the header is invalid.
-                lengths = {int(val) for val in content_length.split(",")}
-                if len(lengths) > 1:
-                    raise InvalidHeader(
-                        "Content-Length contained multiple "
-                        "unmatching values (%s)" % content_length
-                    )
-                length = lengths.pop()
-            except ValueError:
-                length = None
-            else:
-                if length < 0:
-                    length = None
-
-        else:  # if content_length is None
-            length = None
+        # HEAD requests never have a body
+        if request_method == "HEAD":
+            return 0
 
         # Convert status to int for comparison
         # In some cases, httplib returns a status of "_UNKNOWN"
         try:
             status = int(self.status)
         except ValueError:
-            status = 0
+            pass
+        else:
+            # Check for responses that shouldn't include a body
+            if status in (204, 304) or 100 <= status < 200:
+                return 0
 
-        # Check for responses that shouldn't include a body
-        if status in (204, 304) or 100 <= status < 200 or request_method == "HEAD":
-            length = 0
+        content_length = self.headers.get("content-length")
+        if content_length is None:
+            return None
 
-        return length
+        if self.chunked:
+            # This Response will fail with an IncompleteRead if it can't be
+            # received as chunked. This method falls back to attempt reading
+            # the response before raising an exception.
+            log.warning(
+                "Received response with both Content-Length and "
+                "Transfer-Encoding set. This is expressly forbidden "
+                "by RFC 7230 sec 3.3.2. Ignoring Content-Length and "
+                "attempting to process response as Transfer-Encoding: "
+                "chunked."
+            )
+            return None
+
+        # RFC 7230 section 3.3.2 specifies multiple content lengths can
+        # be sent in a single Content-Length header
+        # (e.g. Content-Length: 42, 42). This line ensures the values
+        # are all valid ints and that as long as the `set` length is 1,
+        # all values are the same. Otherwise, the header is invalid.
+        try:
+            lengths = {int(val) for val in content_length.split(",")}
+        except ValueError:
+            return None
+
+        if len(lengths) == 1:
+            length = lengths.pop()
+            if length >= 0:
+                return length
+        else:
+            raise InvalidHeader(
+                "Content-Length contained multiple "
+                "unmatching values (%s)" % content_length
+            )
+
+        return None
 
     @contextmanager
     def _error_catcher(self) -> typing.Generator[None, None, None]:
@@ -864,9 +860,10 @@ class HTTPResponse(BaseHTTPResponse):
             after having ``.read()`` the file object. (Overridden if ``amt`` is
             set.)
         """
-        self._init_decoder()
         if decode_content is None:
             decode_content = self.decode_content
+        if not self._decoder:
+            decode_content = False
 
         if amt is not None:
             cache_content = False
@@ -1043,7 +1040,6 @@ class HTTPResponse(BaseHTTPResponse):
             If True, will attempt to decode the body based on the
             'content-encoding' header.
         """
-        self._init_decoder()
         # FIXME: Rewrite this method and make it a class with a better structured logic.
         if not self.chunked:
             raise ResponseNotChunked(
